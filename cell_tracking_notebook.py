@@ -307,6 +307,24 @@ def link_frames(c1, c2, i1, i2):
     
     for comp_L, comp_R in components:
         nr, nc = len(comp_L), len(comp_R)
+        
+        # If component is too large, O(N^3) LAP will timeout Kaggle (9 hours limit)
+        # Fallback to O(N log N) Greedy assignment for this dense cluster
+        if nr > 200 or nc > 200:
+            cands = []
+            for r in comp_L:
+                for c in comp_R:
+                    if (r, c) in dists_map:
+                        cands.append((dists_map[(r, c)], r, c))
+            cands.sort()
+            used_r, used_c = set(), set()
+            for cost, r, c in cands:
+                if r not in used_r and c not in used_c:
+                    result.append((r, c))
+                    used_r.add(r)
+                    used_c.add(c)
+            continue
+
         cost = np.full((nr + nc, nr + nc), NON_ASSIGN)
         cost[nr:, nc:] = 0.0
         
