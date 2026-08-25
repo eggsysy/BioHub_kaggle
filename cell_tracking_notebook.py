@@ -1,14 +1,13 @@
 """
-Biohub Cell Tracking - V14 Memory-Optimized Pipeline (Target 0.88 - 0.92+)
-=======================================================================
-Architecture: 2x XY spatial resolution (64,128,128) for R_det >= 95%
-Speed:        All per-cell Python loops eliminated - fully vectorized
-Memory (NEW): 
-  1. Connected-Component LAP Tracking: Prevents dense N x N matrix allocation 
-     by splitting bipartite matching into tiny independent subgraphs.
-  2. Streaming CSV Submissions: O(1) memory appending. Eliminates giant 
-     all_rows lists and gigabyte-sized pandas DataFrames.
-  3. Strict garbage collection boundary per dataset.
+Biohub Cell Tracking - V15 (Super-Classical V7 Optimized)
+Targeting 0.90+ Leaderboard Score via Max-Pooling & Hybrid LAP
+
+Features:
+- Isotropic Grid (XY_POOL = 4) for blazing fast 3D operations
+- Max-Pooling downsampling to perfectly preserve small/dim cells (High Recall)
+- Hybrid Connected-Component LAP Tracking (prevents O(N^3) timeouts)
+- cKDTree NMS and Gap Closing (prevents O(N^2) hangs)
+- Streaming CSV Generation (prevents Out of Memory)
 """
 
 import numpy as np
@@ -21,7 +20,7 @@ import warnings
 import gc
 from collections import defaultdict
 
-from scipy.ndimage import gaussian_filter, center_of_mass, label
+from scipy.ndimage import gaussian_filter
 from scipy.spatial import cKDTree
 from scipy.optimize import linear_sum_assignment
 from skimage.feature import peak_local_max
@@ -47,51 +46,47 @@ print(f"[env] zarr={_ZR}  blosc2={_B2}  blosc={_B1}")
 
 
 # ════════════════════════════════════════════════════════════════════
-# CONFIGURATION
+# CONFIGURATION - V15 TUNED
 # ════════════════════════════════════════════════════════════════════
 
-VOXEL_SCALE    = np.array([1.625, 0.40625, 0.40625])  # raw um/voxel (Z,Y,X)
-XY_POOL        = 2                                      # 4x -> 2x for more resolution
-VOXEL_POOLED   = np.array([1.625, 0.40625 * XY_POOL, 0.40625 * XY_POOL])
+VOXEL_SCALE = np.array([1.625, 0.40625, 0.40625])
+XY_POOL_FACTOR = 4
+ISO_SCALE = 1.625  # µm/voxel after pooling
 
-# Anisotropic DoG: sigma_z = sigma_xy / 2  (Z voxel is 2x thicker than XY)
-DOG_ANISO = [
-    ((0.4, 0.8, 0.8), (0.7, 1.4, 1.4)),
-    ((0.7, 1.4, 1.4), (1.1, 2.2, 2.2)),
-    ((1.1, 2.2, 2.2), (1.6, 3.2, 3.2)),
+DOG_SIGMAS_ISO = [
+    (0.6, 1.0),   
+    (1.0, 1.6),   
+    (1.5, 2.4),   
+    (2.2, 3.5),   
 ]
-BG_SIGMA_ANISO   = (2.0, 4.0, 4.0)
-THRESH_K         = 0.12     # slightly more conservative to prevent noise explosions
-THRESH_ABS_FLOOR = 0.003
-PEAK_MIN_DIST_PX = 1
+BG_SIGMA           = 8.0     
+THRESH_OTSU_FACTOR = 0.15    
+THRESH_REL_FLOOR   = 0.005   
+PEAK_MIN_DIST_ISO  = 1       
 
-NMS_UM           = 2.2      # biological nuclear clearance
-INTENSITY_RADIUS = 2        # voxel radius for intensity measurement
+PEAK_NMS_DIST_UM   = 3.5     
+INTENSITY_WIN_ISO  = 2       
 
-MAX_LINK_UM      = 10.0
-DRIFT_RADIUS     = 7.0
-INT_WEIGHT       = 1.2
-NON_ASSIGN       = MAX_LINK_UM * 1.25
+MAX_LINK_DIST_UM   = 10.0    
+INTENSITY_WEIGHT   = 1.5     
+NON_ASSIGN_FACTOR  = 1.25    
 
-GAP_MAX_FRAMES   = 3
-GAP_MAX_UM       = 8.0
-GAP_FRAME_PEN    = 1.5
+GAP_MAX_FRAMES     = 3
+GAP_MAX_DIST_UM    = 8.0
+GAP_FRAME_PENALTY  = 2.0
 
-DIV_P2D_UM       = 8.0      # parent->daughter max dist
-DIV_D2D_UM       = 7.0      # daughter<->daughter max dist
-DIV_MIN_LEN      = 2
-DIV_INT_LO       = 0.35
-DIV_INT_HI       = 2.20
-
-MIN_TRACK_LEN    = 3        # prune short fragments
+DIV_MAX_DIST_UM    = 6.0
+DIV_INTENSITY_TOL  = 0.4     
+DIV_MIN_TRACK_LEN  = 4
+MIN_TRACKLET_LEN   = 3
 
 
 # ════════════════════════════════════════════════════════════════════
 # ZARR I/O
 # ════════════════════════════════════════════════════════════════════
 
-def _read_meta(zp):
-    with open(os.path.join(zp, "0", "zarr.json")) as f:
+def _read_meta(zarr_path):
+    with open(os.path.join(zarr_path, "0", "zarr.json")) as f:
         m = json.load(f)
     shape = tuple(int(s) for s in m["shape"])
     dt = m.get("data_type", m.get("dtype", "uint16"))
@@ -121,180 +116,159 @@ def _open_zarr(path):
     except Exception: return None
 
 
-def read_frame(zp, t, shape, dtype, z_arr=None):
+def read_frame(zarr_path, t, shape, dtype, z_arr=None):
     if z_arr is not None:
         try: return np.asarray(z_arr[t])
         except Exception: pass
-    p = os.path.join(zp, "0", "c", str(t), "0", "0", "0")
+    p = os.path.join(zarr_path, "0", "c", str(t), "0", "0", "0")
     with open(p, "rb") as f: raw = f.read()
     return np.frombuffer(_decompress(raw), dtype=dtype).copy().reshape(shape[1:])
+
+
+# ════════════════════════════════════════════════════════════════════
+# PROCESSING UTILS
+# ════════════════════════════════════════════════════════════════════
+
+def xy_pool_max(frame, factor=XY_POOL_FACTOR):
+    """
+    Max-Pooling downsampling.
+    Preserves maximum intensity of small/dim cells rather than washing them out.
+    """
+    Z, Y, X = frame.shape
+    Yp, Xp = Y // factor, X // factor
+    trimmed = frame[:, :Yp * factor, :Xp * factor].astype(np.float32)
+    return trimmed.reshape(Z, Yp, factor, Xp, factor).max(axis=(2, 4))
+
+
+def _iso_to_orig(coords_iso):
+    out = np.empty_like(coords_iso, dtype=np.float64)
+    out[:, 0] = coords_iso[:, 0]
+    out[:, 1] = coords_iso[:, 1] * XY_POOL_FACTOR + (XY_POOL_FACTOR - 1) / 2.0
+    out[:, 2] = coords_iso[:, 2] * XY_POOL_FACTOR + (XY_POOL_FACTOR - 1) / 2.0
+    return out
+
+
+def _physical_nms(coords_iso, intensities, min_dist_um):
+    """Ultra-fast cKDTree Non-Maximum Suppression"""
+    if len(coords_iso) < 2:
+        return coords_iso, intensities
+
+    order = np.argsort(intensities)[::-1]
+    coords_um = coords_iso[order] * ISO_SCALE
+    tree = cKDTree(coords_um)
+    pairs = tree.query_pairs(r=min_dist_um)
+    
+    suppressed = set()
+    for i, j in sorted(pairs):
+        if i not in suppressed:
+            suppressed.add(j)
+            
+    keep = [i for i in range(len(order)) if i not in suppressed]
+    return coords_iso[order[keep]], intensities[order[keep]]
+
+
+def _extract_local_intensities(vol, coords_iso, radius=INTENSITY_WIN_ISO):
+    intens = np.zeros(len(coords_iso), dtype=np.float32)
+    Z, Y, X = vol.shape
+    for i, (z, y, x) in enumerate(coords_iso):
+        z0, z1 = max(0, int(z) - radius), min(Z, int(z) + radius + 1)
+        y0, y1 = max(0, int(y) - radius), min(Y, int(y) + radius + 1)
+        x0, x1 = max(0, int(x) - radius), min(X, int(x) + radius + 1)
+        intens[i] = np.sum(vol[z0:z1, y0:y1, x0:x1])
+    return intens
 
 
 # ════════════════════════════════════════════════════════════════════
 # DETECTION
 # ════════════════════════════════════════════════════════════════════
 
-def _pool2x(frame):
-    Z, Y, X = frame.shape
-    Yp, Xp = Y // XY_POOL, X // XY_POOL
-    t = frame[:, :Yp * XY_POOL, :Xp * XY_POOL].astype(np.float32)
-    return t.reshape(Z, Yp, XY_POOL, Xp, XY_POOL).mean(axis=(2, 4))
-
-
-def _fast_com_refine(vol, peaks_int):
-    Z, Y, X = vol.shape
-    r = 1
-    lab = np.zeros_like(vol, dtype=np.int32)
-    for idx, (z, y, x) in enumerate(peaks_int, start=1):
-        z0, z1 = max(0, z - r), min(Z, z + r + 1)
-        y0, y1 = max(0, y - r), min(Y, y + r + 1)
-        x0, x1 = max(0, x - r), min(X, x + r + 1)
-        mask = lab[z0:z1, y0:y1, x0:x1] == 0
-        lab[z0:z1, y0:y1, x0:x1][mask] = idx
-        
-    n = len(peaks_int)
-    coms = center_of_mass(vol, labels=lab, index=np.arange(1, n + 1))
-    out = np.array(peaks_int, dtype=np.float32)
-    for i, c in enumerate(coms):
-        if not any(np.isnan(c)):
-            out[i] = c
-    return out
-
-
-def _gather_intensities_vec(vol, coords_int, radius=INTENSITY_RADIUS):
-    Z, Y, X = vol.shape
-    I = vol.cumsum(0).cumsum(1).cumsum(2)
-
-    def _box_sum(z0, z1, y0, y1, x0, x1):
-        def _v(z, y, x):
-            z = np.clip(z, 0, Z - 1)
-            y = np.clip(y, 0, Y - 1)
-            x = np.clip(x, 0, X - 1)
-            return I[z, y, x]
-        return (_v(z1, y1, x1) - _v(z0 - 1, y1, x1) - _v(z1, y0 - 1, x1)
-                - _v(z1, y1, x0 - 1) + _v(z0 - 1, y0 - 1, x1)
-                + _v(z0 - 1, y1, x0 - 1) + _v(z1, y0 - 1, x0 - 1)
-                - _v(z0 - 1, y0 - 1, x0 - 1))
-
-    coords = np.asarray(coords_int)
-    cz, cy, cx = coords[:, 0], coords[:, 1], coords[:, 2]
-    z0 = np.maximum(0, cz - radius)
-    z1 = np.minimum(Z - 1, cz + radius)
-    y0 = np.maximum(0, cy - radius)
-    y1 = np.minimum(Y - 1, cy + radius)
-    x0 = np.maximum(0, cx - radius)
-    x1 = np.minimum(X - 1, cx + radius)
-    return _box_sum(z0, z1, y0, y1, x0, x1).astype(np.float32)
-
-
-def _nms_kdtree(coords_um, intensities, min_dist):
-    if len(coords_um) < 2: return np.arange(len(coords_um))
-    order = np.argsort(intensities)[::-1]
-    s_um = coords_um[order]
-    tree = cKDTree(s_um)
-    pairs = tree.query_pairs(r=min_dist)
-    suppressed = set()
-    for i, j in sorted(pairs):
-        if i not in suppressed: suppressed.add(j)
-    keep = order[[i for i in range(len(order)) if i not in suppressed]]
-    return keep
+def _adaptive_thresh(dog_vol):
+    valid = dog_vol[dog_vol > 0]
+    if len(valid) == 0: return 0.01
+    mu = valid.mean()
+    sd = valid.std()
+    th = mu + THRESH_OTSU_FACTOR * sd
+    return max(th, THRESH_REL_FLOOR * valid.max())
 
 
 def detect_cells(frame):
-    vol = _pool2x(frame)
-    p2, p99 = np.percentile(vol, [2, 99])
-    vol_n = np.clip((vol - p2) / (p99 - p2 + 1e-8), 0.0, 1.0)
-
-    bg = gaussian_filter(vol_n, sigma=BG_SIGMA_ANISO)
-    fg = np.maximum(0.0, vol_n - bg)
+    # Use max-pooling to catch all tiny cells on an isotropic grid
+    vol_iso = xy_pool_max(frame)
+    p2, p99 = np.percentile(vol_iso, [2, 99])
+    vol_n = np.clip((vol_iso - p2) / (p99 - p2 + 1e-8), 0.0, 1.0)
+    
+    # Fast filtering with truncate=3.0 to prevent large kernel lag
+    bg = gaussian_filter(vol_n, sigma=BG_SIGMA, truncate=3.0)
+    fg = np.maximum(0, vol_n - bg)
 
     max_dog = np.zeros_like(fg)
-    for s1, s2 in DOG_ANISO:
-        dog = gaussian_filter(fg, s1) - gaussian_filter(fg, s2)
+    for s1, s2 in DOG_SIGMAS_ISO:
+        g1 = gaussian_filter(fg, s1, truncate=3.0)
+        g2 = gaussian_filter(fg, s2, truncate=3.0)
+        dog = g1 - g2
         np.maximum(max_dog, dog, out=max_dog)
 
-    pos = max_dog[max_dog > 0]
-    if pos.size == 0: return np.empty((0, 3)), np.empty(0)
-    th = max(pos.mean() + THRESH_K * pos.std(), THRESH_ABS_FLOOR * pos.max())
+    th = _adaptive_thresh(max_dog)
     max_dog[max_dog < th] = 0
 
-    peaks_rc = peak_local_max(max_dog, min_distance=PEAK_MIN_DIST_PX, exclude_border=False)
-    if len(peaks_rc) == 0: return np.empty((0, 3)), np.empty(0)
+    peaks = peak_local_max(max_dog, min_distance=PEAK_MIN_DIST_ISO, exclude_border=False)
+    
+    if len(peaks) > 0:
+        intens = _extract_local_intensities(fg, peaks)
+        peaks, intens = _physical_nms(peaks, intens, PEAK_NMS_DIST_UM)
+        orig_coords = _iso_to_orig(peaks)
+        return orig_coords, max_dog[peaks[:, 0], peaks[:, 1], peaks[:, 2]], intens
 
-    peaks_f = _fast_com_refine(max_dog, peaks_rc)
-    intens = _gather_intensities_vec(fg, peaks_rc)
-
-    coords_um = peaks_f * VOXEL_POOLED
-    keep = _nms_kdtree(coords_um, intens, NMS_UM)
-    peaks_f, intens = peaks_f[keep], intens[keep]
-
-    orig = np.empty_like(peaks_f, dtype=np.float64)
-    orig[:, 0] = peaks_f[:, 0]
-    orig[:, 1] = peaks_f[:, 1] * XY_POOL + (XY_POOL - 1) / 2.0
-    orig[:, 2] = peaks_f[:, 2] * XY_POOL + (XY_POOL - 1) / 2.0
-    return orig, intens
+    return np.empty((0, 3)), np.empty(0), np.empty(0)
 
 
 # ════════════════════════════════════════════════════════════════════
-# TRACKING (Connected Components LAP - Memory Safe)
+# HYBRID TRACKING
 # ════════════════════════════════════════════════════════════════════
-
-def _drift_vec(p1_um, p2_um):
-    if len(p1_um) < 5 or len(p2_um) < 5: return np.zeros(3)
-    tree = cKDTree(p2_um)
-    dists, idx = tree.query(p1_um, distance_upper_bound=DRIFT_RADIUS)
-    valid = dists < np.inf
-    if valid.sum() < 5: return np.zeros(3)
-    return np.median(p2_um[idx[valid]] - p1_um[valid], axis=0)
-
 
 def link_frames(c1, c2, i1, i2):
     """
-    Connected-component LAP.
-    Splits bipartite graph into tiny subgraphs, solving assignment independently.
-    Prevents allocating giant dense cost matrices when node count is high.
+    Connected Components LAP with Greedy Fallback.
+    O(N^3) LAP is used for sparse valid clusters.
+    O(N log N) Greedy is used if cluster > 200 (prevents Kaggle Timeout).
     """
     if len(c1) == 0 or len(c2) == 0: return []
-
+    
     p1 = c1 * VOXEL_SCALE
     p2 = c2 * VOXEL_SCALE
-    drift = _drift_vec(p1, p2)
-    p1d = p1 + drift
-
+    
+    # Build Adjacency and Distances
     tree2 = cKDTree(p2)
-    pairs = tree2.query_ball_point(p1d, r=MAX_LINK_UM)
-
-    # 1. Build adjacency list and distance map
+    pairs = tree2.query_ball_point(p1, r=MAX_LINK_DIST_UM)
+    
     adj = defaultdict(list)
     dists_map = {}
     
     for r, cands in enumerate(pairs):
         for c in cands:
             d = np.linalg.norm(p1[r] - p2[c])
-            if d <= MAX_LINK_UM:
+            if d <= MAX_LINK_DIST_UM:
                 li = abs(np.log(max(i1[r], 1e-5)) - np.log(max(i2[c], 1e-5)))
-                cost_val = d + INT_WEIGHT * li
+                cost_val = d + INTENSITY_WEIGHT * li
                 adj[f"L{r}"].append(f"R{c}")
                 adj[f"R{c}"].append(f"L{r}")
                 dists_map[(r, c)] = cost_val
-
+                
     if not dists_map: return []
 
-    # 2. Extract Connected Components via BFS
+    # BFS Connected Components
     visited = set()
     components = []
     
     for node in adj.keys():
         if node not in visited:
-            comp_L = []
-            comp_R = []
+            comp_L, comp_R = [], []
             q = [node]
             visited.add(node)
             while q:
                 cur = q.pop()
                 if cur.startswith("L"): comp_L.append(int(cur[1:]))
                 else: comp_R.append(int(cur[1:]))
-                
                 for nb in adj[cur]:
                     if nb not in visited:
                         visited.add(nb)
@@ -302,14 +276,13 @@ def link_frames(c1, c2, i1, i2):
             if comp_L and comp_R:
                 components.append((comp_L, comp_R))
 
-    # 3. Solve LAP independently for each tiny component
     result = []
-    
+    non_assign = MAX_LINK_DIST_UM * NON_ASSIGN_FACTOR
+
     for comp_L, comp_R in components:
         nr, nc = len(comp_L), len(comp_R)
         
-        # If component is too large, O(N^3) LAP will timeout Kaggle (9 hours limit)
-        # Fallback to O(N log N) Greedy assignment for this dense cluster
+        # --- TIMEOUT FIX: Greedy Fallback for Massive Clusters ---
         if nr > 200 or nc > 200:
             cands = []
             for r in comp_L:
@@ -319,13 +292,15 @@ def link_frames(c1, c2, i1, i2):
             cands.sort()
             used_r, used_c = set(), set()
             for cost, r, c in cands:
+                if cost > MAX_LINK_DIST_UM: continue
                 if r not in used_r and c not in used_c:
                     result.append((r, c))
                     used_r.add(r)
                     used_c.add(c)
             continue
 
-        cost = np.full((nr + nc, nr + nc), NON_ASSIGN)
+        # --- EXACT LAP FOR SMALL CLUSTERS ---
+        cost = np.full((nr + nc, nr + nc), non_assign)
         cost[nr:, nc:] = 0.0
         
         ri = {v: k for k, v in enumerate(comp_L)}
@@ -336,76 +311,93 @@ def link_frames(c1, c2, i1, i2):
                 if (r, c) in dists_map:
                     cost[ri[r], ci[c]] = dists_map[(r, c)]
                     
-        for k in range(nr): cost[k, nc + k] = NON_ASSIGN
-        for k in range(nc): cost[nr + k, k] = NON_ASSIGN
+        for k in range(nr): cost[k, nc + k] = non_assign
+        for k in range(nc): cost[nr + k, k] = non_assign
         
         ra, ca = linear_sum_assignment(cost)
         for r_idx, c_idx in zip(ra, ca):
             if r_idx < nr and c_idx < nc:
-                result.append((comp_L[r_idx], comp_R[c_idx]))
+                r, c = comp_L[r_idx], comp_R[c_idx]
+                if dists_map.get((r, c), np.inf) <= MAX_LINK_DIST_UM:
+                    result.append((r, c))
                 
     return result
+
+
+def _velocity(nodes, edges, node_map, nid, t):
+    parent = [s for s, tgt in edges if tgt == nid]
+    if not parent: return np.zeros(3)
+    pid = parent[0]
+    p_node = next(n for n in nodes if n[0] == pid)
+    c_node = next(n for n in nodes if n[0] == nid)
+    return (np.array(c_node[2:]) - np.array(p_node[2:])) * VOXEL_SCALE
 
 
 # ════════════════════════════════════════════════════════════════════
 # GAP CLOSING
 # ════════════════════════════════════════════════════════════════════
 
-def gap_close(nodes, edges, T):
+def gap_close(nodes, edges, node_map, T):
+    terminals = []
+    starts = []
+    
     adj_fwd = defaultdict(list)
     adj_rev = defaultdict(list)
     for s, t_ in edges:
         adj_fwd[s].append(t_); adj_rev[t_].append(s)
-
-    nd = {n[0]: n for n in nodes}
-
-    def _vel(nid):
-        pars = adj_rev[nid]
-        if not pars: return np.zeros(3)
-        pid = pars[0]
-        pn, cn = nd[pid], nd[nid]
-        return (np.array(cn[2:5]) - np.array(pn[2:5])) * VOXEL_SCALE
-
-    terminals, starts = [], []
-    for nid, t, z, y, x, iv in nodes:
-        if not adj_fwd[nid] and t < T - 1:
-            terminals.append((nid, t, np.array([z, y, x])))
-        if not adj_rev[nid] and t > 0:
-            starts.append((nid, t, np.array([z, y, x])))
-
+        
+    for nid, t, z, y, x in nodes:
+        if len(adj_fwd[nid]) == 0 and t < T - 1:
+            terminals.append((nid, t, np.array([z,y,x])))
+        if len(adj_rev[nid]) == 0 and t > 0:
+            starts.append((nid, t, np.array([z,y,x])))
+            
     starts_by_t = defaultdict(list)
     for s in starts: starts_by_t[s[1]].append(s)
-
-    gap_nodes, gap_edges = [], []
-    new_nid = max(n[0] for n in nodes) + 1
+            
+    gap_edges = []
+    gap_nodes = []
+    new_nid = max((n[0] for n in nodes), default=0) + 1
+    
     used_t, used_s = set(), set()
-
+    
     for gap in range(1, GAP_MAX_FRAMES + 1):
         for term_nid, term_t, term_pos in terminals:
             if term_nid in used_t: continue
-            v = _vel(term_nid)
-            pred_um = term_pos * VOXEL_SCALE + v * gap
-
+            
+            cands_starts = starts_by_t.get(term_t + gap + 1, [])
+            if not cands_starts: continue
+            
+            term_v = _velocity(nodes, edges, node_map, term_nid, term_t)
+            pred_pos_um = (term_pos * VOXEL_SCALE) + (term_v * gap)
+            
+            start_um = np.array([s[2]*VOXEL_SCALE for s in cands_starts])
+            tree = cKDTree(start_um)
+            idxs = tree.query_ball_point(pred_pos_um, r=GAP_MAX_DIST_UM)
+            
             cand = []
-            for s_nid, s_t, s_pos in starts_by_t.get(term_t + gap + 1, []):
+            for idx in idxs:
+                s_nid, s_t, s_pos = cands_starts[idx]
                 if s_nid in used_s: continue
-                d = np.linalg.norm(s_pos * VOXEL_SCALE - pred_um)
-                if d + gap * GAP_FRAME_PEN <= GAP_MAX_UM:
-                    cand.append((d, s_nid, s_pos))
-
+                dist = np.linalg.norm((s_pos * VOXEL_SCALE) - pred_pos_um)
+                if dist + (gap * GAP_FRAME_PENALTY) <= GAP_MAX_DIST_UM:
+                    cand.append((dist, s_nid, s_pos))
+                        
             if cand:
                 cand.sort()
-                _, best_nid, s_pos = cand[0]
-                used_t.add(term_nid); used_s.add(best_nid)
-                prev = term_nid
+                best_dist, best_start, start_pos = cand[0]
+                used_t.add(term_nid); used_s.add(best_start)
+                
+                prev_nid = term_nid
                 for g in range(1, gap + 1):
-                    f = g / (gap + 1)
-                    ip = term_pos + f * (s_pos - term_pos)
-                    gap_nodes.append((new_nid, term_t + g, *map(float, ip), 1.0))
-                    gap_edges.append((prev, new_nid))
-                    prev = new_nid; new_nid += 1
-                gap_edges.append((prev, best_nid))
-
+                    frac = g / (gap + 1)
+                    i_pos = term_pos + frac * (start_pos - term_pos)
+                    gap_nodes.append((new_nid, term_t + g, i_pos[0], i_pos[1], i_pos[2]))
+                    gap_edges.append((prev_nid, new_nid))
+                    prev_nid = new_nid
+                    new_nid += 1
+                gap_edges.append((prev_nid, best_start))
+                
     return gap_nodes, gap_edges
 
 
@@ -413,228 +405,203 @@ def gap_close(nodes, edges, T):
 # BRANCHING MITOSIS
 # ════════════════════════════════════════════════════════════════════
 
-def detect_divisions(nodes, edges, interp_nids):
+def detect_divisions(nodes, edges, interp_nids, all_intensities, node_map):
     adj_fwd = defaultdict(list)
     adj_rev = defaultdict(list)
     for s, t_ in edges:
         adj_fwd[s].append(t_); adj_rev[t_].append(s)
+        
+    terminals, starts = [], []
+    node_dict = {n[0]: {"t": n[1], "pos": np.array(n[2:])} for n in nodes}
+    
+    def _track_len(nid, forward=True):
+        l, curr = 1, nid
+        while True:
+            nxt = adj_fwd[curr] if forward else adj_rev[curr]
+            if not nxt: break
+            curr = nxt[0]; l += 1
+        return l
 
-    nd = {n[0]: n for n in nodes}
+    for nid, data in node_dict.items():
+        if nid in interp_nids: continue
+        if not adj_fwd[nid] and _track_len(nid, False) >= DIV_MIN_TRACK_LEN: terminals.append(nid)
+        if not adj_rev[nid] and _track_len(nid, True) >= DIV_MIN_TRACK_LEN: starts.append(nid)
+            
+    candidates = []
+    for p_nid in terminals:
+        p = node_dict[p_nid]
+        t = p["t"]
+        
+        try:
+            p_idx = [k for k, v in node_map.items() if v == p_nid][0][1]
+            p_int = all_intensities[t][p_idx]
+        except IndexError: continue
+            
+        d_cands = []
+        for s_nid in starts:
+            s = node_dict[s_nid]
+            if s["t"] == t + 1:
+                dist = np.linalg.norm((p["pos"] - s["pos"]) * VOXEL_SCALE)
+                if dist <= DIV_MAX_DIST_UM:
+                    try:
+                        s_idx = [k for k, v in node_map.items() if v == s_nid][0][1]
+                        s_int = all_intensities[t+1][s_idx]
+                        d_cands.append((dist, s_nid, s_int))
+                    except IndexError: pass
+                        
+        if len(d_cands) >= 2:
+            d_cands.sort()
+            for i in range(len(d_cands)):
+                for j in range(i + 1, len(d_cands)):
+                    d1_dist, d1_nid, d1_int = d_cands[i]
+                    d2_dist, d2_nid, d2_int = d_cands[j]
+                    
+                    sum_d = d1_int + d2_int
+                    if sum_d > 0:
+                        ratio = p_int / sum_d
+                        if (1.0 - DIV_INTENSITY_TOL) <= ratio <= (1.0 + DIV_INTENSITY_TOL):
+                            cost = d1_dist + d2_dist
+                            candidates.append((cost, p_nid, d1_nid, d2_nid))
 
-    fwd_depth = {}
-    def _fwd(nid):
-        if nid in fwd_depth: return fwd_depth[nid]
-        stack, depth = [(nid, 0)], {}
-        while stack:
-            cur, d = stack.pop()
-            if cur in depth: continue
-            depth[cur] = d
-            for nxt in adj_fwd[cur]: stack.append((nxt, d + 1))
-        fwd_depth.update(depth)
-        return fwd_depth[nid]
-
-    bwd_depth = {}
-    def _bwd(nid):
-        if nid in bwd_depth: return bwd_depth[nid]
-        stack, depth = [(nid, 0)], {}
-        while stack:
-            cur, d = stack.pop()
-            if cur in depth: continue
-            depth[cur] = d
-            for prv in adj_rev[cur]: stack.append((prv, d + 1))
-        bwd_depth.update(depth)
-        return bwd_depth[nid]
-
-    for n in nodes:
-        _fwd(n[0]); _bwd(n[0])
-
-    starts_by_t = defaultdict(list)
-    for n in nodes:
-        nid = n[0]
-        if nid not in interp_nids and not adj_rev[nid] and fwd_depth.get(nid, 0) >= DIV_MIN_LEN:
-            starts_by_t[int(n[1])].append(nid)
-
-    active_by_t = defaultdict(list)
-    for s, t_ in edges:
-        if (s not in interp_nids and t_ not in interp_nids
-                and bwd_depth.get(s, 0) >= DIV_MIN_LEN
-                and fwd_depth.get(t_, 0) >= DIV_MIN_LEN):
-            active_by_t[int(nd[s][1])].append((s, t_))
-
-    div_candidates = []
-    for t, actives in active_by_t.items():
-        d2_nids = starts_by_t.get(t + 1, [])
-        if not d2_nids: continue
-
-        d2_pos_um = np.array([nd[nid][2:5] for nid in d2_nids], dtype=np.float64) * VOXEL_SCALE
-        tree = cKDTree(d2_pos_um)
-
-        for p_nid, d1_nid in actives:
-            p_um  = np.array(nd[p_nid][2:5]) * VOXEL_SCALE
-            d1_um = np.array(nd[d1_nid][2:5]) * VOXEL_SCALE
-            p_int = float(nd[p_nid][5])
-            d1_int= float(nd[d1_nid][5])
-
-            for idx in tree.query_ball_point(p_um, r=DIV_P2D_UM):
-                d2_nid = d2_nids[idx]
-                d2_um  = d2_pos_um[idx]
-                d2_int = float(nd[d2_nid][5])
-
-                if np.linalg.norm(d1_um - d2_um) > DIV_D2D_UM: continue
-                denom = d1_int + d2_int
-                if denom <= 0: continue
-                ratio = p_int / denom
-                if not (DIV_INT_LO <= ratio <= DIV_INT_HI): continue
-
-                cost = np.linalg.norm(p_um - d2_um) + np.linalg.norm(d1_um - d2_um)
-                div_candidates.append((cost, p_nid, d2_nid))
-
-    div_candidates.sort()
-    used_p, used_d, out = set(), set(), []
-    for cost, p, d2 in div_candidates:
-        if p in used_p or d2 in used_d: continue
-        out.append((p, d2)); used_p.add(p); used_d.add(d2)
-    return out
+    candidates.sort()
+    used_p, used_s, div_edges = set(), set(), []
+    
+    for _, p_nid, d1_nid, d2_nid in candidates:
+        if p_nid in used_p or d1_nid in used_s or d2_nid in used_s: continue
+        div_edges.append((p_nid, d1_nid)); div_edges.append((p_nid, d2_nid))
+        used_p.add(p_nid); used_s.add(d1_nid); used_s.add(d2_nid)
+        
+    return div_edges
 
 
-# ════════════════════════════════════════════════════════════════════
-# TRACKLET PRUNING
-# ════════════════════════════════════════════════════════════════════
-
-def prune(nodes, edges):
-    adj = defaultdict(set)
-    for s, t_ in edges: adj[s].add(t_); adj[t_].add(s)
-    visited, valid = set(), set()
-    for n in nodes:
-        nid = n[0]
-        if nid in visited: continue
-        comp, q = set(), [nid]
-        while q:
-            cur = q.pop()
-            if cur in visited: continue
-            visited.add(cur); comp.add(cur)
-            q.extend(adj[cur] - visited)
-        if len(comp) >= MIN_TRACK_LEN: valid.update(comp)
-    return [n for n in nodes if n[0] in valid], \
-           [(s, t_) for s, t_ in edges if s in valid and t_ in valid]
+def prune_short_tracklets(nodes, edges):
+    adj = defaultdict(list)
+    for s, t_ in edges: adj[s].append(t_); adj[t_].append(s)
+    visited, valid_nids = set(), set()
+    node_ids = [n[0] for n in nodes]
+    for nid in node_ids:
+        if nid not in visited:
+            q, comp = [nid], {nid}
+            visited.add(nid)
+            while q:
+                curr = q.pop(0)
+                for nb in adj[curr]:
+                    if nb not in visited:
+                        visited.add(nb); comp.add(nb); q.append(nb)
+            if len(comp) >= MIN_TRACKLET_LEN: valid_nids.update(comp)
+    return ([n for n in nodes if n[0] in valid_nids],
+            [(s, t_) for s, t_ in edges if s in valid_nids and t_ in valid_nids])
 
 
 # ════════════════════════════════════════════════════════════════════
-# PIPELINE
+# PIPELINE RUNNER
 # ════════════════════════════════════════════════════════════════════
 
-def process_dataset(zp, ds):
+def process_dataset(zarr_path, ds_name):
     t0 = time.time()
-    shape, dtype = _read_meta(zp)
+    shape, dtype = _read_meta(zarr_path)
     T = shape[0]
-    print(f"  [{ds}] shape={shape}  dtype={dtype}")
+    print(f"  [{ds_name}] shape={shape}  dtype={dtype}")
 
-    z_arr = _open_zarr(zp)
-    all_c, all_i = {}, {}
-    total = 0
+    z_arr = _open_zarr(zarr_path)
+    all_coords, all_intensities = {}, {}
+    total_cells = 0
 
     for t in range(T):
-        frame = read_frame(zp, t, shape, dtype, z_arr)
-        c, i = detect_cells(frame)
-        all_c[t], all_i[t] = c, i
-        total += len(c)
-        if t % 25 == 0: print(f"    detect  t={t:>3}/{T}  cells={len(c)}")
-        
-    print(f"    detection done - avg {total/max(T,1):.0f} cells/frame, {total} total")
+        frame = read_frame(zarr_path, t, shape, dtype, z_arr)
+        coords, _, intens = detect_cells(frame)
+        all_coords[t] = coords
+        all_intensities[t] = intens
+        total_cells += len(coords)
+        if t % 25 == 0: print(f"    detect  t={t:>3d}/{T}  cells={len(coords)}")
+
+    avg = total_cells / max(T, 1)
+    print(f"    detection done — avg {avg:.0f} cells/frame, {total_cells} total")
 
     nid = 1
-    nmap = {}
-    nodes = []
+    node_map, nodes = {}, []
     for t in range(T):
-        for i, (z, y, x) in enumerate(all_c[t]):
-            iv = float(all_i[t][i]) if i < len(all_i[t]) else 1.0
-            nmap[(t, i)] = nid
-            nodes.append((nid, t, float(z), float(y), float(x), iv))
+        for i, (z, y, x) in enumerate(all_coords[t]):
+            node_map[(t, i)] = nid
+            nodes.append((nid, t, int(z), int(y), int(x)))
             nid += 1
 
     edges = []
     for t in range(T - 1):
-        for si, ti in link_frames(all_c[t], all_c[t+1], all_i[t], all_i[t+1]):
-            edges.append((nmap[(t, si)], nmap[(t+1, ti)]))
+        assn = link_frames(all_coords[t], all_coords[t + 1], all_intensities[t], all_intensities[t + 1])
+        for si, ti in assn: edges.append((node_map[(t, si)], node_map[(t + 1, ti)]))
     print(f"    pass-1:  {len(edges)} edges")
 
-    gn, ge = gap_close(nodes, edges, T)
-    interp = {n[0] for n in gn}
-    nodes.extend(gn); edges.extend(ge)
-    print(f"    gap-close:  +{len(gn)} nodes, +{len(ge)} edges")
+    gap_nodes, gap_edges = gap_close(nodes, edges, node_map, T)
+    interp_nids = set(n[0] for n in gap_nodes)
+    nodes.extend(gap_nodes); edges.extend(gap_edges)
+    print(f"    gap-close:  +{len(gap_nodes)} nodes, +{len(gap_edges)} edges")
 
-    de = detect_divisions(nodes, edges, interp)
-    edges.extend(de)
-    print(f"    divisions:  +{len(de)} edges")
+    div_edges = detect_divisions(nodes, edges, interp_nids, all_intensities, node_map)
+    edges.extend(div_edges)
+    print(f"    divisions:  +{len(div_edges)} edges")
 
-    nodes, edges = prune(nodes, edges)
+    nodes, edges = prune_short_tracklets(nodes, edges)
     elapsed = time.time() - t0
-    print(f"  [{ds}] ✓  {len(nodes)} nodes  {len(edges)} edges  ({elapsed:.1f}s)\n")
+    print(f"  [{ds_name}] ✓  {len(nodes)} nodes  {len(edges)} edges  ({elapsed:.1f}s)\n")
     
-    # Close zarr cache explicitly to prevent leak
-    del z_arr, all_c, all_i
+    del z_arr, all_coords, all_intensities
     return nodes, edges
 
 
-def create_submission(test_dir, out_path):
-    dirs = sorted(glob.glob(os.path.join(test_dir, "*.zarr")))
-    print(f"\n{'='*64}")
-    print(f"  Biohub V14 Memory-Optimized - {len(dirs)} datasets")
-    print(f"{'='*64}\n")
+def create_submission(test_dir, output_path):
+    zarr_dirs = sorted(glob.glob(os.path.join(test_dir, "*.zarr")))
+    print(f"\n{'=' * 64}")
+    print(f"  Biohub Cell Tracking V15 (Super-Classical Optimized) — {len(zarr_dirs)} datasets")
+    print(f"{'=' * 64}\n")
 
-    cols = ["id","dataset","row_type","node_id","t","z","y","x","source_id","target_id"]
-    df_empty = pd.DataFrame(columns=cols)
-    df_empty.to_csv(out_path, index=False)
+    cols = ["id", "dataset", "row_type", "node_id", "t", "z", "y", "x", "source_id", "target_id"]
+    pd.DataFrame(columns=cols).to_csv(output_path, index=False)
 
-    row_id = 0
-    total_nodes = 0
-    total_edges = 0
-    
-    for zp in dirs:
+    row_id, total_nodes, total_edges = 0, 0, 0
+
+    for zp in zarr_dirs:
         ds = os.path.basename(zp).replace(".zarr", "")
         try:
             nodes, edges = process_dataset(zp, ds)
-        except Exception as e:
+        except Exception as exc:
             import traceback; traceback.print_exc()
-            print(f"  [{ds}] ERROR - stub")
-            nodes = [(1,0,32,128,128,1.0),(2,1,32,128,128,1.0)]
-            edges = [(1,2)]
+            nodes = [(1, 0, 32, 128, 128), (2, 1, 32, 128, 128)]
+            edges = [(1, 2)]
 
         chunk = []
-        for item in nodes:
-            nid, t, z, y, x = item[0], item[1], item[2], item[3], item[4]
+        for nid, t, z, y, x in nodes:
             chunk.append([row_id, ds, "node", nid, t, z, y, x, -1, -1])
             row_id += 1
-        for s, t_ in edges:
-            chunk.append([row_id, ds, "edge", -1, -1, -1, -1, -1, s, t_])
+        for src, tgt in edges:
+            chunk.append([row_id, ds, "edge", -1, -1, -1, -1, -1, src, tgt])
             row_id += 1
 
         df_chunk = pd.DataFrame(chunk, columns=cols)
         for c in cols[3:]: df_chunk[c] = df_chunk[c].astype(int)
-        df_chunk.to_csv(out_path, mode='a', header=False, index=False)
+        df_chunk.to_csv(output_path, mode='a', header=False, index=False)
 
         total_nodes += len(nodes)
         total_edges += len(edges)
         
-        # OOM Prevention Boundary
         del chunk, df_chunk, nodes, edges
         gc.collect()
 
-    print(f"{'='*64}")
-    print(f"  Saved -> {out_path}")
-    print(f"  {len(dirs)} datasets | {total_nodes:,} nodes | {total_edges:,} edges | {row_id:,} total rows")
-    print(f"{'='*64}\n")
+    print(f"{'=' * 64}")
+    print(f"  Submission saved → {output_path}")
+    print(f"  {len(zarr_dirs)} datasets  |  {total_nodes:,} nodes  |  {total_edges:,} edges")
+    print(f"{'=' * 64}\n")
 
 
 if __name__ == "__main__":
-    TEST_DIR = "/kaggle/input/competitions/biohub-cell-tracking-during-development/test"
-    OUT_CSV  = "submission.csv"
-
-    t0 = time.time()
-    create_submission(TEST_DIR, OUT_CSV)
+    TEST_DIR  = "/kaggle/input/competitions/biohub-cell-tracking-during-development/test"
+    OUT_CSV   = "submission.csv"
     
-    print(f"Total wall time: {(time.time()-t0)/60:.1f} min")
-    
-    # Just show a preview to user to confirm structure
-    preview = pd.read_csv(OUT_CSV, nrows=20)
-    print(preview)
+    # Optional debug switch to local if test path missing
+    if not os.path.exists(TEST_DIR):
+        print(f"WARNING: Path {TEST_DIR} does not exist. Update TEST_DIR for local testing.")
+    else:
+        t_wall = time.time()
+        create_submission(TEST_DIR, OUT_CSV)
+        print(f"Total wall time: {(time.time() - t_wall) / 60:.1f} min")
+        print(pd.read_csv(OUT_CSV, nrows=20))
