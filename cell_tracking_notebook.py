@@ -60,22 +60,22 @@ DOG_SIGMAS_ISO = [
     (2.2, 3.5),   
 ]
 BG_SIGMA           = 8.0     
-THRESH_OTSU_FACTOR = 0.15    
-THRESH_REL_FLOOR   = 0.005   
+THRESH_OTSU_FACTOR = 0.0     # Lowered to heavily boost recall of dim cells
+THRESH_REL_FLOOR   = 0.002   # Lowered floor for dim cells
 PEAK_MIN_DIST_ISO  = 1       
 
 PEAK_NMS_DIST_UM   = 3.5     
 INTENSITY_WIN_ISO  = 2       
 
-MAX_LINK_DIST_UM   = 10.0    
+MAX_LINK_DIST_UM   = 12.0    # Relaxed to connect faster moving cells
 INTENSITY_WEIGHT   = 1.5     
 NON_ASSIGN_FACTOR  = 1.25    
 
 GAP_MAX_FRAMES     = 3
-GAP_MAX_DIST_UM    = 8.0
+GAP_MAX_DIST_UM    = 15.0    # Drastically increased to allow fast cells to close gaps
 GAP_FRAME_PENALTY  = 2.0
 
-DIV_MAX_DIST_UM    = 6.0
+DIV_MAX_DIST_UM    = 8.0     # Increased to allow daughters to jump further
 DIV_INTENSITY_TOL  = 0.4     
 DIV_MIN_TRACK_LEN  = 4
 MIN_TRACKLET_LEN   = 3
@@ -129,15 +129,16 @@ def read_frame(zarr_path, t, shape, dtype, z_arr=None):
 # PROCESSING UTILS
 # ════════════════════════════════════════════════════════════════════
 
-def xy_pool_max(frame, factor=XY_POOL_FACTOR):
+def xy_pool(frame, factor=XY_POOL_FACTOR):
     """
-    Max-Pooling downsampling.
-    Preserves maximum intensity of small/dim cells rather than washing them out.
+    Mean-Pooling downsampling.
+    Crucial for suppressing shot noise (acts as a box blur). 
+    Dim cells are preserved via lowered thresholds.
     """
     Z, Y, X = frame.shape
     Yp, Xp = Y // factor, X // factor
     trimmed = frame[:, :Yp * factor, :Xp * factor].astype(np.float32)
-    return trimmed.reshape(Z, Yp, factor, Xp, factor).max(axis=(2, 4))
+    return trimmed.reshape(Z, Yp, factor, Xp, factor).mean(axis=(2, 4))
 
 
 def _iso_to_orig(coords_iso):
@@ -192,8 +193,8 @@ def _adaptive_thresh(dog_vol):
 
 
 def detect_cells(frame):
-    # Use max-pooling to catch all tiny cells on an isotropic grid
-    vol_iso = xy_pool_max(frame)
+    # Use mean-pooling to radically suppress shot noise
+    vol_iso = xy_pool(frame)
     p2, p99 = np.percentile(vol_iso, [2, 99])
     vol_n = np.clip((vol_iso - p2) / (p99 - p2 + 1e-8), 0.0, 1.0)
     
