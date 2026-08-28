@@ -60,8 +60,8 @@ DOG_SIGMAS_ISO = [
     (2.2, 3.5),   
 ]
 BG_SIGMA           = 8.0     
-THRESH_OTSU_FACTOR = 0.10    # Slightly relaxed from 0.15 for better recall
-THRESH_REL_FLOOR   = 0.005   
+THRESH_OTSU_FACTOR = 0.00    # Pushed back down to 0.0 to maximize recall
+THRESH_REL_FLOOR   = 0.002   # Lowered floor for dim cells
 PEAK_MIN_DIST_ISO  = 1       
 
 PEAK_NMS_DIST_UM   = 3.5     
@@ -155,8 +155,14 @@ def _physical_nms(coords_iso, intensities, min_dist_um):
         return coords_iso, intensities
 
     order = np.argsort(intensities)[::-1]
-    coords_um = coords_iso[order] * ISO_SCALE
-    tree = cKDTree(coords_um)
+    
+    # 3. Anisotropic Z-NMS
+    # Multiply Z by 1.5 to penalize Z-distance. Cells directly above/below each other
+    # are less likely to suppress each other compared to cells side-by-side.
+    coords_um_nms = coords_iso[order] * ISO_SCALE
+    coords_um_nms[:, 0] *= 1.5  
+    
+    tree = cKDTree(coords_um_nms)
     pairs = tree.query_pairs(r=min_dist_um)
     
     suppressed = set()
@@ -229,25 +235,35 @@ def detect_cells(frame):
 
 def link_frames(c1, c2, i1, i2):
     """
-    Connected Components LAP with Greedy Fallback.
-    O(N^3) LAP is used for sparse valid clusters.
-    O(N log N) Greedy is used if cluster > 200 (prevents Kaggle Timeout).
+    Connected Components LAP with Drift Flow Compensation.
     """
     if len(c1) == 0 or len(c2) == 0: return []
     
     p1 = c1 * VOXEL_SCALE
     p2 = c2 * VOXEL_SCALE
     
-    # Build Adjacency and Distances
+    # 1. Collective Tissue Drift Flow Compensation
     tree2 = cKDTree(p2)
-    pairs = tree2.query_ball_point(p1, r=MAX_LINK_DIST_UM)
+    # Estimate drift using a strict local neighborhood
+    d, idx = tree2.query(p1, k=1, distance_upper_bound=10.0)
+    valid = d < 10.0
+    drift = np.zeros(3)
+    if np.any(valid):
+        diffs = p2[idx[valid]] - p1[valid]
+        drift = np.median(diffs, axis=0)
+    
+    p1_drift = p1 + drift
+    
+    # Build Adjacency and Distances
+    pairs = tree2.query_ball_point(p1_drift, r=MAX_LINK_DIST_UM)
     
     adj = defaultdict(list)
     dists_map = {}
     
     for r, cands in enumerate(pairs):
         for c in cands:
-            d = np.linalg.norm(p1[r] - p2[c])
+            # Distance is calculated from the DRIFT-COMPENSATED position!
+            d = np.linalg.norm(p1_drift[r] - p2[c])
             if d <= MAX_LINK_DIST_UM:
                 li = abs(np.log(max(i1[r], 1e-5)) - np.log(max(i2[c], 1e-5)))
                 cost_val = d + INTENSITY_WEIGHT * li
@@ -444,6 +460,22 @@ def detect_divisions(nodes, edges, interp_nids, all_intensities, node_map):
                     if sum_d > 0:
                         ratio = p_int / sum_d
                         if (1.0 - DIV_INTENSITY_TOL) <= ratio <= (1.0 + DIV_INTENSITY_TOL):
+                            # 2. Opposite-Daughter Angle Prior
+                            # Daughters should jump away from parent in opposite directions!
+                            d1_pos = node_dict[d1_nid]["pos"] * VOXEL_SCALE
+                            d2_pos = node_dict[d2_nid]["pos"] * VOXEL_SCALE
+                            p_pos = p["pos"] * VOXEL_SCALE
+                            
+                            v1 = d1_pos - p_pos
+                            v2 = d2_pos - p_pos
+                            n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+                            
+                            if n1 > 0 and n2 > 0:
+                                cos_sim = np.dot(v1, v2) / (n1 * n2)
+                                # If daughters are moving in same direction (angle < 60 deg), it's a false division
+                                if cos_sim > 0.5:
+                                    continue
+                                    
                             cost = d1_dist + d2_dist
                             candidates.append((cost, p_nid, d1_nid, d2_nid))
 
