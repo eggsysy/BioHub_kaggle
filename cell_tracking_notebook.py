@@ -60,22 +60,22 @@ DOG_SIGMAS_ISO = [
     (2.2, 3.5),   
 ]
 BG_SIGMA           = 8.0     
-THRESH_OTSU_FACTOR = 0.0     # Lowered to heavily boost recall of dim cells
-THRESH_REL_FLOOR   = 0.002   # Lowered floor for dim cells
+THRESH_OTSU_FACTOR = 0.10    # Slightly relaxed from 0.15 for better recall
+THRESH_REL_FLOOR   = 0.005   
 PEAK_MIN_DIST_ISO  = 1       
 
 PEAK_NMS_DIST_UM   = 3.5     
 INTENSITY_WIN_ISO  = 2       
 
-MAX_LINK_DIST_UM   = 12.0    # Relaxed to connect faster moving cells
+MAX_LINK_DIST_UM   = 7.0     # STRICT LIMIT to shatter graph into tiny components (Timeout immunity)
 INTENSITY_WEIGHT   = 1.5     
 NON_ASSIGN_FACTOR  = 1.25    
 
 GAP_MAX_FRAMES     = 3
-GAP_MAX_DIST_UM    = 15.0    # Drastically increased to allow fast cells to close gaps
+GAP_MAX_DIST_UM    = 12.0    # Relaxed Gap Distance for fast-moving cells
 GAP_FRAME_PENALTY  = 2.0
 
-DIV_MAX_DIST_UM    = 8.0     # Increased to allow daughters to jump further
+DIV_MAX_DIST_UM    = 7.0     
 DIV_INTENSITY_TOL  = 0.4     
 DIV_MIN_TRACK_LEN  = 4
 MIN_TRACKLET_LEN   = 3
@@ -283,23 +283,6 @@ def link_frames(c1, c2, i1, i2):
     for comp_L, comp_R in components:
         nr, nc = len(comp_L), len(comp_R)
         
-        # --- TIMEOUT FIX: Greedy Fallback for Massive Clusters ---
-        if nr > 200 or nc > 200:
-            cands = []
-            for r in comp_L:
-                for c in comp_R:
-                    if (r, c) in dists_map:
-                        cands.append((dists_map[(r, c)], r, c))
-            cands.sort()
-            used_r, used_c = set(), set()
-            for cost, r, c in cands:
-                if cost > MAX_LINK_DIST_UM: continue
-                if r not in used_r and c not in used_c:
-                    result.append((r, c))
-                    used_r.add(r)
-                    used_c.add(c)
-            continue
-
         # --- EXACT LAP FOR SMALL CLUSTERS ---
         cost = np.full((nr + nc, nr + nc), non_assign)
         cost[nr:, nc:] = 0.0
