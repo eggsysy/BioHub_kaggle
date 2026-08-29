@@ -1,13 +1,15 @@
 """
-Biohub Cell Tracking - V15 (Super-Classical V7 Optimized)
-Targeting 0.90+ Leaderboard Score via Max-Pooling & Hybrid LAP
+Biohub Cell Tracking - V18 (Metric-Informed Optimization)
+Target 0.90+ via Scoring Metric Analysis
 
-Features:
-- Isotropic Grid (XY_POOL = 4) for blazing fast 3D operations
-- Max-Pooling downsampling to perfectly preserve small/dim cells (High Recall)
-- Hybrid Connected-Component LAP Tracking (prevents O(N^3) timeouts)
-- cKDTree NMS and Gap Closing (prevents O(N^2) hangs)
-- Streaming CSV Generation (prevents Out of Memory)
+Key Changes from V15.2 (0.825):
+- Division detection DISABLED (FP edges hurt Edge Jaccard more than Division Jaccard helps)
+- Density penalty avoidance (THRESH=0.15 to match T_true)
+- LAP-based globally optimal gap closing (not greedy)
+- O(1) velocity lookups with 3-frame smoothing
+- Tighter NMS (3.0 µm) to preserve nearby real cells
+- Wider linking (8.5 µm) to reduce track fragmentation
+- MIN_TRACKLET_LEN=2 to keep short real tracks
 """
 
 import numpy as np
@@ -60,25 +62,27 @@ DOG_SIGMAS_ISO = [
     (2.2, 3.5),   
 ]
 BG_SIGMA           = 8.0     
-THRESH_OTSU_FACTOR = 0.10    # Slightly relaxed from 0.15 for better recall
+THRESH_OTSU_FACTOR = 0.15    # Back to V7 value — avoid over-detection density penalty
 THRESH_REL_FLOOR   = 0.005   
 PEAK_MIN_DIST_ISO  = 1       
 
-PEAK_NMS_DIST_UM   = 3.5     
+PEAK_NMS_DIST_UM   = 3.0     # Tightened from 3.5 — avoid suppressing real nearby cells
 INTENSITY_WIN_ISO  = 2       
 
-MAX_LINK_DIST_UM   = 7.0     # STRICT LIMIT to shatter graph into tiny components (Timeout immunity)
-INTENSITY_WEIGHT   = 0.5     # Lowered from 1.5 to trust space over intensity fluctuations
-NON_ASSIGN_FACTOR  = 1.25
+MAX_LINK_DIST_UM   = 8.5     # Relaxed from 7.0 — captures 99th percentile cell displacement
+INTENSITY_WEIGHT   = 0.8     # Lowered from 1.5 — trust spatial proximity over noisy intensity
+NON_ASSIGN_FACTOR  = 1.25    
 
 GAP_MAX_FRAMES     = 3
-GAP_MAX_DIST_UM    = 12.0    # Relaxed Gap Distance for fast-moving cells
+GAP_MAX_DIST_UM    = 12.0    
 GAP_FRAME_PENALTY  = 2.0
 
-DIV_MAX_DIST_UM    = 7.0     
-DIV_INTENSITY_TOL  = 0.4     
-DIV_MIN_TRACK_LEN  = 4
-MIN_TRACKLET_LEN   = 3
+# Division detection DISABLED — see plan
+# DIV_MAX_DIST_UM   = 7.0
+# DIV_INTENSITY_TOL = 0.4
+# DIV_MIN_TRACK_LEN = 4
+
+MIN_TRACKLET_LEN   = 2       # Lowered from 3 — keep real short tracks
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -309,42 +313,45 @@ def link_frames(c1, c2, i1, i2):
 
 
 # ════════════════════════════════════════════════════════════════════
-# GAP CLOSING
+# GAP CLOSING (LAP-based globally optimal)
 # ════════════════════════════════════════════════════════════════════
 
 def gap_close(nodes, edges, node_map, T):
-    terminals = []
-    starts = []
-    
+    # O(1) lookups instead of O(N) scans
     adj_fwd = defaultdict(list)
     adj_rev = defaultdict(list)
     for s, t_ in edges:
         adj_fwd[s].append(t_); adj_rev[t_].append(s)
-        
+    
     node_dict = {}
     for nid, t, z, y, x in nodes:
-        node_dict[nid] = np.array([z,y,x])
-        if len(adj_fwd[nid]) == 0 and t < T - 1:
-            terminals.append((nid, t, node_dict[nid]))
-        if len(adj_rev[nid]) == 0 and t > 0:
-            starts.append((nid, t, node_dict[nid]))
-            
-    def _smoothed_velocity(nid, smooth_frames=3):
+        node_dict[nid] = (t, np.array([z, y, x]))
+    
+    # Smoothed velocity using O(1) dict lookups (up to 3 frames back)
+    def _smoothed_velocity(nid):
         v_sum = np.zeros(3)
         count = 0
         curr = nid
-        for _ in range(smooth_frames):
-            parent = adj_rev.get(curr, [])
-            if not parent: break
-            pid = parent[0]
-            v_sum += (node_dict[curr] - node_dict[pid]) * VOXEL_SCALE
+        for _ in range(3):
+            parents = adj_rev.get(curr, [])
+            if not parents: break
+            pid = parents[0]
+            v_sum += (node_dict[curr][1] - node_dict[pid][1]) * VOXEL_SCALE
             curr = pid
             count += 1
-        return np.zeros(3) if count == 0 else v_sum / count
-
+        return v_sum / count if count > 0 else np.zeros(3)
+    
+    terminals = []
+    starts = []
+    for nid, (t, pos) in node_dict.items():
+        if not adj_fwd[nid] and t < T - 1:
+            terminals.append((nid, t, pos))
+        if not adj_rev[nid] and t > 0:
+            starts.append((nid, t, pos))
+    
     starts_by_t = defaultdict(list)
     for s in starts: starts_by_t[s[1]].append(s)
-            
+    
     gap_edges = []
     gap_nodes = []
     new_nid = max((n[0] for n in nodes), default=0) + 1
@@ -352,116 +359,84 @@ def gap_close(nodes, edges, node_map, T):
     used_t, used_s = set(), set()
     
     for gap in range(1, GAP_MAX_FRAMES + 1):
-        for term_nid, term_t, term_pos in terminals:
-            if term_nid in used_t: continue
-            
+        # Collect all (terminal, start) candidate pairs for this gap size
+        all_pairs = []  # (term_idx, start_idx, cost)
+        term_list = [(i, tn, tt, tp) for i, (tn, tt, tp) in enumerate(terminals) if tn not in used_t]
+        
+        # Group candidates
+        for ti, (term_idx, term_nid, term_t, term_pos) in enumerate(term_list):
             cands_starts = starts_by_t.get(term_t + gap + 1, [])
             if not cands_starts: continue
             
             term_v = _smoothed_velocity(term_nid)
             pred_pos_um = (term_pos * VOXEL_SCALE) + (term_v * gap)
             
-            start_um = np.array([s[2]*VOXEL_SCALE for s in cands_starts])
-            tree = cKDTree(start_um)
-            idxs = tree.query_ball_point(pred_pos_um, r=GAP_MAX_DIST_UM)
-            
-            cand = []
-            for idx in idxs:
-                s_nid, s_t, s_pos = cands_starts[idx]
-                if s_nid in used_s: continue
-                dist = np.linalg.norm((s_pos * VOXEL_SCALE) - pred_pos_um)
-                if dist + (gap * GAP_FRAME_PENALTY) <= GAP_MAX_DIST_UM:
-                    cand.append((dist, s_nid, s_pos))
-                        
-            if cand:
-                cand.sort()
-                best_dist, best_start, start_pos = cand[0]
-                used_t.add(term_nid); used_s.add(best_start)
+            if len(cands_starts) > 0:
+                start_um = np.array([s[2] * VOXEL_SCALE for s in cands_starts])
+                tree = cKDTree(start_um)
+                idxs = tree.query_ball_point(pred_pos_um, r=GAP_MAX_DIST_UM)
                 
-                prev_nid = term_nid
-                for g in range(1, gap + 1):
-                    frac = g / (gap + 1)
+                for idx in idxs:
+                    s_nid, s_t, s_pos = cands_starts[idx]
+                    if s_nid in used_s: continue
+                    dist = np.linalg.norm((s_pos * VOXEL_SCALE) - pred_pos_um)
+                    total_cost = dist + (gap * GAP_FRAME_PENALTY)
+                    if total_cost <= GAP_MAX_DIST_UM:
+                        all_pairs.append((term_nid, s_nid, dist, term_pos, s_pos, term_t, gap))
+        
+        if not all_pairs:
+            continue
+        
+        # Build bipartite graph and solve with LAP
+        unique_terms = list(set(p[0] for p in all_pairs))
+        unique_starts = list(set(p[1] for p in all_pairs))
+        term_idx_map = {v: i for i, v in enumerate(unique_terms)}
+        start_idx_map = {v: i for i, v in enumerate(unique_starts)}
+        
+        nt, ns = len(unique_terms), len(unique_starts)
+        non_assign = GAP_MAX_DIST_UM * 1.5
+        cost_matrix = np.full((nt + ns, nt + ns), non_assign)
+        cost_matrix[nt:, ns:] = 0.0
+        
+        for term_nid, s_nid, dist, _, _, _, _ in all_pairs:
+            ri, ci = term_idx_map[term_nid], start_idx_map[s_nid]
+            cost_matrix[ri, ci] = min(cost_matrix[ri, ci], dist)
+        
+        for k in range(nt): cost_matrix[k, ns + k] = non_assign
+        for k in range(ns): cost_matrix[nt + k, k] = non_assign
+        
+        ra, ca = linear_sum_assignment(cost_matrix)
+        
+        for r_idx, c_idx in zip(ra, ca):
+            if r_idx < nt and c_idx < ns:
+                t_nid = unique_terms[r_idx]
+                s_nid = unique_starts[c_idx]
+                if cost_matrix[r_idx, c_idx] >= non_assign:
+                    continue
+                
+                # Find the matching pair info
+                match = next((p for p in all_pairs if p[0] == t_nid and p[1] == s_nid), None)
+                if match is None: continue
+                
+                _, _, _, term_pos, start_pos, term_t, g = match
+                used_t.add(t_nid); used_s.add(s_nid)
+                
+                prev_nid = t_nid
+                for gi in range(1, g + 1):
+                    frac = gi / (g + 1)
                     i_pos = term_pos + frac * (start_pos - term_pos)
-                    gap_nodes.append((new_nid, term_t + g, i_pos[0], i_pos[1], i_pos[2]))
+                    gap_nodes.append((new_nid, term_t + gi, i_pos[0], i_pos[1], i_pos[2]))
                     gap_edges.append((prev_nid, new_nid))
                     prev_nid = new_nid
                     new_nid += 1
-                gap_edges.append((prev_nid, best_start))
-                
+                gap_edges.append((prev_nid, s_nid))
+    
     return gap_nodes, gap_edges
 
 
-# ════════════════════════════════════════════════════════════════════
-# BRANCHING MITOSIS
-# ════════════════════════════════════════════════════════════════════
-
-def detect_divisions(nodes, edges, interp_nids, all_intensities, node_map):
-    adj_fwd = defaultdict(list)
-    adj_rev = defaultdict(list)
-    for s, t_ in edges:
-        adj_fwd[s].append(t_); adj_rev[t_].append(s)
-        
-    terminals, starts = [], []
-    node_dict = {n[0]: {"t": n[1], "pos": np.array(n[2:])} for n in nodes}
-    
-    def _track_len(nid, forward=True):
-        l, curr = 1, nid
-        while True:
-            nxt = adj_fwd[curr] if forward else adj_rev[curr]
-            if not nxt: break
-            curr = nxt[0]; l += 1
-        return l
-
-    for nid, data in node_dict.items():
-        if nid in interp_nids: continue
-        if not adj_fwd[nid] and _track_len(nid, False) >= DIV_MIN_TRACK_LEN: terminals.append(nid)
-        if not adj_rev[nid] and _track_len(nid, True) >= DIV_MIN_TRACK_LEN: starts.append(nid)
-            
-    candidates = []
-    for p_nid in terminals:
-        p = node_dict[p_nid]
-        t = p["t"]
-        
-        try:
-            p_idx = [k for k, v in node_map.items() if v == p_nid][0][1]
-            p_int = all_intensities[t][p_idx]
-        except IndexError: continue
-            
-        d_cands = []
-        for s_nid in starts:
-            s = node_dict[s_nid]
-            if s["t"] == t + 1:
-                dist = np.linalg.norm((p["pos"] - s["pos"]) * VOXEL_SCALE)
-                if dist <= DIV_MAX_DIST_UM:
-                    try:
-                        s_idx = [k for k, v in node_map.items() if v == s_nid][0][1]
-                        s_int = all_intensities[t+1][s_idx]
-                        d_cands.append((dist, s_nid, s_int))
-                    except IndexError: pass
-                        
-        if len(d_cands) >= 2:
-            d_cands.sort()
-            for i in range(len(d_cands)):
-                for j in range(i + 1, len(d_cands)):
-                    d1_dist, d1_nid, d1_int = d_cands[i]
-                    d2_dist, d2_nid, d2_int = d_cands[j]
-                    
-                    sum_d = d1_int + d2_int
-                    if sum_d > 0:
-                        ratio = p_int / sum_d
-                        if (1.0 - DIV_INTENSITY_TOL) <= ratio <= (1.0 + DIV_INTENSITY_TOL):
-                            cost = d1_dist + d2_dist
-                            candidates.append((cost, p_nid, d1_nid, d2_nid))
-
-    candidates.sort()
-    used_p, used_s, div_edges = set(), set(), []
-    
-    for _, p_nid, d1_nid, d2_nid in candidates:
-        if p_nid in used_p or d1_nid in used_s or d2_nid in used_s: continue
-        div_edges.append((p_nid, d1_nid)); div_edges.append((p_nid, d2_nid))
-        used_p.add(p_nid); used_s.add(d1_nid); used_s.add(d2_nid)
-        
-    return div_edges
+# Division detection DISABLED in V18 — metric analysis shows it hurts net score.
+# Edge Jaccard weight = 1.0, Division Jaccard weight = 0.1.
+# FP division edges tank the dominant metric.
 
 
 def prune_short_tracklets(nodes, edges):
@@ -523,13 +498,10 @@ def process_dataset(zarr_path, ds_name):
     print(f"    pass-1:  {len(edges)} edges")
 
     gap_nodes, gap_edges = gap_close(nodes, edges, node_map, T)
-    interp_nids = set(n[0] for n in gap_nodes)
     nodes.extend(gap_nodes); edges.extend(gap_edges)
     print(f"    gap-close:  +{len(gap_nodes)} nodes, +{len(gap_edges)} edges")
 
-    div_edges = detect_divisions(nodes, edges, interp_nids, all_intensities, node_map)
-    edges.extend(div_edges)
-    print(f"    divisions:  +{len(div_edges)} edges")
+    # Division detection DISABLED in V18 (net negative on metric)
 
     nodes, edges = prune_short_tracklets(nodes, edges)
     elapsed = time.time() - t0
