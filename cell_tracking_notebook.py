@@ -60,16 +60,16 @@ DOG_SIGMAS_ISO = [
     (2.2, 3.5),   
 ]
 BG_SIGMA           = 8.0     
-THRESH_OTSU_FACTOR = 0.00    # Pushed back down to 0.0 to maximize recall
-THRESH_REL_FLOOR   = 0.002   # Lowered floor for dim cells
+THRESH_OTSU_FACTOR = 0.10    # Slightly relaxed from 0.15 for better recall
+THRESH_REL_FLOOR   = 0.005   
 PEAK_MIN_DIST_ISO  = 1       
 
 PEAK_NMS_DIST_UM   = 3.5     
 INTENSITY_WIN_ISO  = 2       
 
 MAX_LINK_DIST_UM   = 7.0     # STRICT LIMIT to shatter graph into tiny components (Timeout immunity)
-INTENSITY_WEIGHT   = 1.5     
-NON_ASSIGN_FACTOR  = 1.25    
+INTENSITY_WEIGHT   = 0.5     # Lowered from 1.5 to trust space over intensity fluctuations
+NON_ASSIGN_FACTOR  = 1.25
 
 GAP_MAX_FRAMES     = 3
 GAP_MAX_DIST_UM    = 12.0    # Relaxed Gap Distance for fast-moving cells
@@ -155,14 +155,8 @@ def _physical_nms(coords_iso, intensities, min_dist_um):
         return coords_iso, intensities
 
     order = np.argsort(intensities)[::-1]
-    
-    # 3. Anisotropic Z-NMS
-    # Multiply Z by 1.5 to penalize Z-distance. Cells directly above/below each other
-    # are less likely to suppress each other compared to cells side-by-side.
-    coords_um_nms = coords_iso[order] * ISO_SCALE
-    coords_um_nms[:, 0] *= 1.5  
-    
-    tree = cKDTree(coords_um_nms)
+    coords_um = coords_iso[order] * ISO_SCALE
+    tree = cKDTree(coords_um)
     pairs = tree.query_pairs(r=min_dist_um)
     
     suppressed = set()
@@ -235,35 +229,25 @@ def detect_cells(frame):
 
 def link_frames(c1, c2, i1, i2):
     """
-    Connected Components LAP with Drift Flow Compensation.
+    Connected Components LAP with Greedy Fallback.
+    O(N^3) LAP is used for sparse valid clusters.
+    O(N log N) Greedy is used if cluster > 200 (prevents Kaggle Timeout).
     """
     if len(c1) == 0 or len(c2) == 0: return []
     
     p1 = c1 * VOXEL_SCALE
     p2 = c2 * VOXEL_SCALE
     
-    # 1. Collective Tissue Drift Flow Compensation
-    tree2 = cKDTree(p2)
-    # Estimate drift using a strict local neighborhood
-    d, idx = tree2.query(p1, k=1, distance_upper_bound=10.0)
-    valid = d < 10.0
-    drift = np.zeros(3)
-    if np.any(valid):
-        diffs = p2[idx[valid]] - p1[valid]
-        drift = np.median(diffs, axis=0)
-    
-    p1_drift = p1 + drift
-    
     # Build Adjacency and Distances
-    pairs = tree2.query_ball_point(p1_drift, r=MAX_LINK_DIST_UM)
+    tree2 = cKDTree(p2)
+    pairs = tree2.query_ball_point(p1, r=MAX_LINK_DIST_UM)
     
     adj = defaultdict(list)
     dists_map = {}
     
     for r, cands in enumerate(pairs):
         for c in cands:
-            # Distance is calculated from the DRIFT-COMPENSATED position!
-            d = np.linalg.norm(p1_drift[r] - p2[c])
+            d = np.linalg.norm(p1[r] - p2[c])
             if d <= MAX_LINK_DIST_UM:
                 li = abs(np.log(max(i1[r], 1e-5)) - np.log(max(i2[c], 1e-5)))
                 cost_val = d + INTENSITY_WEIGHT * li
@@ -324,15 +308,6 @@ def link_frames(c1, c2, i1, i2):
     return result
 
 
-def _velocity(nodes, edges, node_map, nid, t):
-    parent = [s for s, tgt in edges if tgt == nid]
-    if not parent: return np.zeros(3)
-    pid = parent[0]
-    p_node = next(n for n in nodes if n[0] == pid)
-    c_node = next(n for n in nodes if n[0] == nid)
-    return (np.array(c_node[2:]) - np.array(p_node[2:])) * VOXEL_SCALE
-
-
 # ════════════════════════════════════════════════════════════════════
 # GAP CLOSING
 # ════════════════════════════════════════════════════════════════════
@@ -346,12 +321,27 @@ def gap_close(nodes, edges, node_map, T):
     for s, t_ in edges:
         adj_fwd[s].append(t_); adj_rev[t_].append(s)
         
+    node_dict = {}
     for nid, t, z, y, x in nodes:
+        node_dict[nid] = np.array([z,y,x])
         if len(adj_fwd[nid]) == 0 and t < T - 1:
-            terminals.append((nid, t, np.array([z,y,x])))
+            terminals.append((nid, t, node_dict[nid]))
         if len(adj_rev[nid]) == 0 and t > 0:
-            starts.append((nid, t, np.array([z,y,x])))
+            starts.append((nid, t, node_dict[nid]))
             
+    def _smoothed_velocity(nid, smooth_frames=3):
+        v_sum = np.zeros(3)
+        count = 0
+        curr = nid
+        for _ in range(smooth_frames):
+            parent = adj_rev.get(curr, [])
+            if not parent: break
+            pid = parent[0]
+            v_sum += (node_dict[curr] - node_dict[pid]) * VOXEL_SCALE
+            curr = pid
+            count += 1
+        return np.zeros(3) if count == 0 else v_sum / count
+
     starts_by_t = defaultdict(list)
     for s in starts: starts_by_t[s[1]].append(s)
             
@@ -368,7 +358,7 @@ def gap_close(nodes, edges, node_map, T):
             cands_starts = starts_by_t.get(term_t + gap + 1, [])
             if not cands_starts: continue
             
-            term_v = _velocity(nodes, edges, node_map, term_nid, term_t)
+            term_v = _smoothed_velocity(term_nid)
             pred_pos_um = (term_pos * VOXEL_SCALE) + (term_v * gap)
             
             start_um = np.array([s[2]*VOXEL_SCALE for s in cands_starts])
@@ -460,22 +450,6 @@ def detect_divisions(nodes, edges, interp_nids, all_intensities, node_map):
                     if sum_d > 0:
                         ratio = p_int / sum_d
                         if (1.0 - DIV_INTENSITY_TOL) <= ratio <= (1.0 + DIV_INTENSITY_TOL):
-                            # 2. Opposite-Daughter Angle Prior
-                            # Daughters should jump away from parent in opposite directions!
-                            d1_pos = node_dict[d1_nid]["pos"] * VOXEL_SCALE
-                            d2_pos = node_dict[d2_nid]["pos"] * VOXEL_SCALE
-                            p_pos = p["pos"] * VOXEL_SCALE
-                            
-                            v1 = d1_pos - p_pos
-                            v2 = d2_pos - p_pos
-                            n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
-                            
-                            if n1 > 0 and n2 > 0:
-                                cos_sim = np.dot(v1, v2) / (n1 * n2)
-                                # If daughters are moving in same direction (angle < 60 deg), it's a false division
-                                if cos_sim > 0.5:
-                                    continue
-                                    
                             cost = d1_dist + d2_dist
                             candidates.append((cost, p_nid, d1_nid, d2_nid))
 
