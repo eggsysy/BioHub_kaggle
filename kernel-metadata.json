@@ -1,5 +1,5 @@
 {
-  "id": "eggsysy/biohub-cell-tracking-v14-submission",
+  "id": "eggsysy/unet-baseline-inference-submission",
   "title": "UNet baseline - inference & submission",
   "code_file": "cell_tracking_notebook.ipynb",
   "language": "python",
@@ -15,5 +15,6 @@
     "biohub-cell-tracking-during-development"
   ],
   "kernel_sources": [],
-  "model_sources": []
+  "model_sources": [],
+  "machine_shape": "NvidiaTeslaT4"
 }
