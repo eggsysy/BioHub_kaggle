@@ -1,15 +1,16 @@
 {
   "id": "eggsysy/biohub-cell-tracking-v14-submission",
-  "title": "Biohub Cell Tracking V14 Submission",
-  "code_file": "cell_tracking_notebook.py",
+  "title": "UNet baseline - inference & submission",
+  "code_file": "cell_tracking_notebook.ipynb",
   "language": "python",
-  "kernel_type": "script",
-  "is_private": "true",
-  "enable_gpu": "false",
-  "enable_tpu": "false",
-  "enable_internet": "false",
-  "machine_shape": "N1_HIGHMEM_8",
-  "dataset_sources": [],
+  "kernel_type": "notebook",
+  "is_private": false,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "dataset_sources": [
+    "thibautgoldsborough/cellmot-baseline-artifacts"
+  ],
   "competition_sources": [
     "biohub-cell-tracking-during-development"
   ],
