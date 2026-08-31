@@ -1,0 +1,18 @@
+{
+  "id": "eggsysy/biohub-cell-tracking-v14-submission",
+  "title": "Biohub Cell Tracking V14 Submission",
+  "code_file": "cell_tracking_notebook.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_tpu": "false",
+  "enable_internet": "false",
+  "machine_shape": "N1_HIGHMEM_8",
+  "dataset_sources": [],
+  "competition_sources": [
+    "biohub-cell-tracking-during-development"
+  ],
+  "kernel_sources": [],
+  "model_sources": []
+}
