@@ -9,7 +9,8 @@
   "enable_tpu": false,
   "enable_internet": false,
   "dataset_sources": [
-    "thibautgoldsborough/cellmot-baseline-artifacts"
+    "thibautgoldsborough/cellmot-baseline-artifacts",
+    "eggsysy/biohub-trained-weights-v1"
   ],
   "competition_sources": [
     "biohub-cell-tracking-during-development"
