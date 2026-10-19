@@ -1,0 +1,60 @@
+# ---- OS / editor ----
+.DS_Store
+**/.DS_Store
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv*/
+.wheels/
+*.whl
+
+# ---- Large data / model artifacts ----
+# Prediction caches, ground truth zarrs, model weights
+cache/
+gt/
+artifacts/
+my-trained-weights/
+ft_div_weights/
+*.pt
+*.pth
+*.ckpt
+*.zarr/
+*.pkl
+
+# ---- Run outputs (regenerable) ----
+kernel_logs*/
+optuna_output*/
+optuna_kernel/
+optimized_kernel/
+training_output/
+ft_full/
+ft_div/
+ft_div_all/
+ft_calib/
+w3_sweep/
+sew20_output2/
+probe_divgates/
+probe_nosafediv/
+sub_ftdiv/
+sub_reyhan/
+sub_forge/
+
+# ---- Submissions / intermediate CSVs ----
+submission.csv
+div_candidates.csv
+gt_stats.csv
+*.jsonl
+
+# ---- Logs ----
+*.log
+temp.txt
+
+# ---- Nested clones (have their own .git) ----
+official_repo/
+runpodctl
+
+# ---- Generated .geff prediction graphs (regenerable) ----
+**/predictions/
+*.geff/

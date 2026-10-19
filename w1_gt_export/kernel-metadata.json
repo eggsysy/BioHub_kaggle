@@ -1,0 +1,15 @@
+{
+  "id": "eggsysy/biohub-gt-export",
+  "title": "biohub-gt-export",
+  "code_file": "gt_export.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "dataset_sources": [],
+  "kernel_sources": [],
+  "competition_sources": ["biohub-cell-tracking-during-development"],
+  "model_sources": []
+}

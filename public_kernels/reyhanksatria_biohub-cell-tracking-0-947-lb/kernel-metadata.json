@@ -1,0 +1,27 @@
+{
+  "id": "reyhanksatria/biohub-cell-tracking-0-947-lb",
+  "id_no": 133199516,
+  "title": "Biohub Cell Tracking: 0.947 LB",
+  "code_file": "biohub-cell-tracking-0-947-lb.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": false,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "keywords": [
+    "gpu"
+  ],
+  "dataset_sources": [
+    "",
+    "",
+    ""
+  ],
+  "kernel_sources": [],
+  "competition_sources": [
+    "biohub-cell-tracking-during-development"
+  ],
+  "model_sources": [],
+  "docker_image": "gcr.io/kaggle-private-byod/python@sha256:37c64f7dd9c54116ecd1bcc88817c5469b88387388fade02bfa8bf3fc647d461",
+  "machine_shape": "NvidiaTeslaT4"
+}

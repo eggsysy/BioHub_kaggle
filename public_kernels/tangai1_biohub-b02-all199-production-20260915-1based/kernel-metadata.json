@@ -1,0 +1,21 @@
+{
+  "id": "tangai1/biohub-b02-all199-production-20260915-1based",
+  "id_no": 134424194,
+  "title": "BioHub B02 All199 Production 20260915 1Based",
+  "code_file": "biohub-b02-all199-production-20260915-1based.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": false,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "keywords": [],
+  "dataset_sources": [],
+  "kernel_sources": [],
+  "competition_sources": [
+    "biohub-cell-tracking-during-development"
+  ],
+  "model_sources": [],
+  "docker_image": "gcr.io/kaggle-images/python@sha256:dafd4ce5668bbf1ad422e4c109e0f18c9623c3a7c7f48b0235f13142755c40b9",
+  "machine_shape": "None"
+}
